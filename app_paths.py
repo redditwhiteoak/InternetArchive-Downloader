@@ -1,0 +1,26 @@
+"""Application path helpers."""
+
+import os
+import sys
+
+
+def get_app_base_dir():
+    if getattr(sys, "frozen", False):
+        return os.path.dirname(sys.executable)
+    return os.path.dirname(os.path.abspath(__file__))
+
+
+def get_settings_path():
+    return os.path.join(get_app_base_dir(), "ia_downloader_settings.json")
+
+
+def get_history_path():
+    return os.path.join(get_app_base_dir(), "ia_downloader_history.json")
+
+
+def get_log_path():
+    return os.path.join(get_app_base_dir(), "ia_downloader.log")
+
+
+def get_autosave_path():
+    return os.path.join(get_app_base_dir(), "ia_downloader_autosave_state.json")

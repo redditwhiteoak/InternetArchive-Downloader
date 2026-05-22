@@ -1,0 +1,15 @@
+{
+  "version": 5,
+  "urls": [
+    "https://archive.org/download/example_identifier",
+    "https://archive.org/details/another_example_identifier?tab=files"
+  ],
+  "destination": "",
+  "use_config": false,
+  "config_file": "",
+  "verify_sizes": true,
+  "verbose": false,
+  "concurrent_downloads": 2,
+  "stop_if_no_space": true,
+  "extensions": ".zip,.7z"
+}

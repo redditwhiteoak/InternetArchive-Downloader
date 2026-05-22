@@ -1,0 +1,30 @@
+# Python
+__pycache__/
+*.py[cod]
+*.pyo
+*.pyd
+.venv/
+venv/
+env/
+*.egg-info/
+dist/
+build/
+*.spec
+
+# App generated files
+ia_downloader_settings.json
+ia_downloader_history.json
+ia_downloader.log
+*.part
+*.log
+
+# Internet Archive credentials - never commit
+ia.ini
+.config/
+internetarchive/
+
+# OS/editor
+.DS_Store
+Thumbs.db
+.vscode/
+.idea/
