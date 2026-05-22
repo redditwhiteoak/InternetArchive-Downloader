@@ -25,6 +25,7 @@ import platform
 import subprocess
 import threading
 import queue
+import webbrowser
 from urllib.parse import urlparse, unquote
 
 import tkinter as tk
@@ -214,7 +215,7 @@ class IADownloaderGUI(DownloaderMixin, SchedulerMixin):
         menubar.add_cascade(label="File", menu=file_menu)
 
         downloads_menu = tk.Menu(menubar, tearoff=0)
-        downloads_menu.add_command(label="Refresh Queue / Check Disk Space", command=self.check_queue_only)
+        downloads_menu.add_command(label="Refresh Queue + Disk Space", command=self.check_queue_only)
         downloads_menu.add_command(label="Start Downloads", command=self.start_downloads)
         downloads_menu.add_command(label="Pause / Resume Starting Files", command=self.toggle_pause)
         downloads_menu.add_command(label="Stop After Active Downloads", command=self.request_stop)
@@ -230,7 +231,8 @@ class IADownloaderGUI(DownloaderMixin, SchedulerMixin):
         edit_menu.add_command(label="Remove All Bad URLs", command=self.remove_all_bad_urls)
         edit_menu.add_separator()
         edit_menu.add_command(label="Clear Log", command=self.clear_log)
-        edit_menu.add_command(label="Clear Download Table", command=self.clear_downloads)
+        edit_menu.add_command(label="Clear Download View", command=self.clear_downloads)
+        edit_menu.add_command(label="Reset Inputs", command=self.reset_inputs)
         menubar.add_cascade(label="Edit", menu=edit_menu)
 
         view_menu = tk.Menu(menubar, tearoff=0)
@@ -241,6 +243,7 @@ class IADownloaderGUI(DownloaderMixin, SchedulerMixin):
 
         help_menu = tk.Menu(menubar, tearoff=0)
         help_menu.add_command(label="About", command=self.show_about)
+        help_menu.add_command(label="GitHub Repository", command=self.open_github_repo)
         menubar.add_cascade(label="Help", menu=help_menu)
 
         self.root.config(menu=menubar)
@@ -440,8 +443,11 @@ class IADownloaderGUI(DownloaderMixin, SchedulerMixin):
         control_frame.grid(row=1, column=2, sticky="nsew", padx=(6, 0))
         control_frame.configure(width=210)
 
-        self.check_btn = ttk.Button(control_frame, text="↻ REFRESH", command=self.check_queue_only)
+        self.check_btn = ttk.Button(control_frame, text="↻ REFRESH QUEUE + DISK", command=self.check_queue_only)
         self.check_btn.pack(fill=tk.X, pady=(0, 8), ipady=2)
+
+        self.reset_btn = ttk.Button(control_frame, text="⟲ RESET INPUTS", command=self.reset_inputs)
+        self.reset_btn.pack(fill=tk.X, pady=(0, 8), ipady=2)
 
         self.start_btn = ttk.Button(control_frame, text="▶ START", command=self.start_downloads, style="Accent.TButton")
         self.start_btn.pack(fill=tk.X, pady=(0, 8), ipady=2)
@@ -1033,7 +1039,18 @@ class IADownloaderGUI(DownloaderMixin, SchedulerMixin):
                     else:
                         self.active_tree.insert("", tk.END, iid=row_id, text=combined_name, values=values)
 
-                    self.active_tree.see(row_id)
+                    # Keep the active-downloads table anchored to the oldest active row.
+                    # Previously every progress update called see(row_id), so parallel
+                    # downloads made the table jump to whichever row updated last.
+                    anchor_row = None
+                    try:
+                        anchor_row = self.current_display_row_id
+                    except Exception:
+                        anchor_row = None
+                    if anchor_row and self.active_tree.exists(anchor_row):
+                        self.active_tree.see(anchor_row)
+                    elif self.active_tree.get_children():
+                        self.active_tree.see(self.active_tree.get_children()[0])
                     self.active_tree.update_idletasks()
                     self.update_stats_cards()
 
@@ -1231,30 +1248,64 @@ class IADownloaderGUI(DownloaderMixin, SchedulerMixin):
             messagebox.showerror("Clear Log Error", str(e))
 
     def clear_downloads(self):
+        """Clear the visible download information without deleting table rows or saved row data."""
         if self.downloads_tree:
             for row in self.downloads_tree.get_children():
-                self.downloads_tree.delete(row)
-        for row in self.active_tree.get_children():
-            self.active_tree.delete(row)
-        self.row_to_source_url.clear()
-        self.failed_urls.clear()
-        self.detached_download_rows.clear()
-        self.download_rows.clear()
-        self.resume_pending_jobs.clear()
+                try:
+                    self.downloads_tree.item(row, values=("", "", "", "", ""))
+                except Exception:
+                    pass
+
+        if self.active_tree:
+            for row in self.active_tree.get_children():
+                try:
+                    self.active_tree.item(row, text="", values=("", "", "", "", "", ""))
+                except Exception:
+                    pass
+            if not self.active_tree.get_children():
+                self.active_tree.insert(
+                    "",
+                    tk.END,
+                    iid="__no_active__",
+                    text="No active downloads",
+                    values=("", "", "", "", "", "Waiting")
+                )
+
         self.progress_var.set(0)
         self.file_progress_var.set(0)
         self.current_file_var.set("Current file: idle")
-        self.status_var.set("Ready")
+        self.status_var.set("Download view cleared")
+        self.log("Download view cleared. Table rows, queue data, log, and history were preserved.")
+
+    def reset_inputs(self):
+        """Reset all user-entered inputs/settings to their default empty state."""
+        if self.worker_thread and self.worker_thread.is_alive():
+            messagebox.showinfo("Downloads Running", "Stop the current downloads before resetting inputs.")
+            return
+
+        self.urls_text.delete("1.0", tk.END)
+        self.dest_var.set("")
+        self.extensions_var.set("")
+        self.use_config_var.set(False)
+        self.config_var.set("")
+        self.size_check_var.set(True)
+        self.stop_if_no_space_var.set(True)
+        self.verbose_var.set(False)
+        self.part_action_var.set("Ask, auto-start over after 5 minutes")
+        try:
+            self.concurrent_var.set(1)
+        except Exception:
+            pass
+
+        self.update_loaded_queue_display("")
+        self.update_url_count()
+        self.invalidate_check_cache()
+        self.rebuild_queue_table()
+        self.rebuild_queue_files_table()
         self.total_size_var.set("Total queue size: not checked")
         self.disk_space_var.set("Disk space: not checked")
-        self.active_tree.insert(
-            "",
-            tk.END,
-            iid="__no_active__",
-            text="No active downloads",
-            values=("", "", "", "", "", "Waiting")
-        )
-        self.log("Download table cleared. Log and history were preserved.")
+        self.status_var.set("Inputs reset")
+        self.log("Inputs reset.")
 
     def open_destination_folder(self):
         dest = self.dest_var.get().strip()
@@ -1933,12 +1984,16 @@ class IADownloaderGUI(DownloaderMixin, SchedulerMixin):
         btn_frame.pack(fill=tk.X, pady=(8, 0))
         ttk.Button(btn_frame, text="Close", command=win.destroy).pack(side=tk.RIGHT)
 
+    def open_github_repo(self):
+        webbrowser.open("https://github.com/redditwhiteoak/InternetArchive-Downloader")
+
     def show_about(self):
         messagebox.showinfo(
             "About IA Batch Downloader GUI",
             "IA Batch Downloader GUI\n\n"
             "Batch download Internet Archive items with queue management, "
-            "resume-friendly size checks, parallel downloads, and logging."
+            "resume-friendly size checks, parallel downloads, and logging.\n\n"
+            "GitHub: https://github.com/redditwhiteoak/InternetArchive-Downloader"
         )
 
     def request_stop(self):
@@ -2302,12 +2357,17 @@ class IADownloaderGUI(DownloaderMixin, SchedulerMixin):
     # -------------------------
     def check_queue_only(self):
         """
-        Refresh queue size and free space without starting downloads.
-        This can run while downloads are active, but only one refresh can run at a time.
+        Refresh the parsed queue display, total queue estimate, and destination disk space
+        without starting downloads. This can run while downloads are active, but only
+        one refresh can run at a time.
         """
         if self.queue_check_thread and self.queue_check_thread.is_alive():
             messagebox.showinfo("Busy", "A queue refresh is already running.")
             return
+
+        self.update_url_count()
+        self.rebuild_queue_table()
+        self.rebuild_queue_files_table()
 
         urls = self.get_urls()
         dest = self.dest_var.get().strip()
