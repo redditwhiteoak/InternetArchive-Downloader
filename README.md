@@ -133,39 +133,6 @@ assets/internet_archive_downloader_logo.ico
 
 Build from the project folder with `build_windows_exe.bat`. The app now loads bundled assets from PyInstaller's temporary resource folder, so the header logo and window icon should appear even when only `dist/IA_Batch_Downloader.exe` is copied to another folder.
 
-## Recommended GitHub layout
-
-Commit the source code and documentation to the repository:
-
-```text
-InternetArchive-Downloader/
-├── README.md
-├── CONTRIBUTING.md
-├── LICENSE
-├── requirements.txt
-├── main.py
-├── gui.py
-├── downloader.py
-├── scheduler.py
-├── models.py
-├── app_paths.py
-├── assets/
-├── docs/
-├── examples/
-├── build_windows_exe.bat
-└── IA_Batch_Downloader.spec
-```
-
-Do **not** commit downloaded content, `.part` files, local settings, logs, autosave state files, or large generated builds.
-
-For the compiled executable, the best GitHub location is **Releases**, not the normal source tree:
-
-1. Go to the GitHub repo.
-2. Click **Releases**.
-3. Click **Draft a new release**.
-4. Upload `dist/IA_Batch_Downloader.exe` as a release asset.
-
-If you really want the executable inside the repository, put it under `releases/` or `dist/`, but this is not recommended because compiled binaries make the repo larger and harder to track.
 
 ## Project files
 
@@ -206,8 +173,3 @@ These should stay out of GitHub.
 - Stop preserves resume state.
 - Closing the application autosaves current state.
 - Use the Help menu for the GitHub repository link.
-
-
-## v77 build/runtime fix
-
-Fixed the Windows executable startup error `name 'get_resource_path' is not defined` by importing the bundled-resource helper in `gui.py`. Also adjusted the Tk window icon call to use the bundled `.ico` file through PyInstaller.
