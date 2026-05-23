@@ -9,11 +9,11 @@ env/
 *.egg-info/
 dist/
 build/
-*.spec
 
 # App generated files
 ia_downloader_settings.json
 ia_downloader_history.json
+ia_downloader_autosave_state.json
 ia_downloader.log
 *.part
 *.log

@@ -77,6 +77,74 @@ class SchedulerMixin:
 
         return finished_count
 
+
+    def run_streaming_scheduler(self, identifier, pending_jobs, producer_done_event):
+        """Run downloads while another part of the program is still building the queue.
+
+        pending_jobs is a shared list. The producer appends jobs in strict URL/file
+        order and calls scheduler_event.set(). This scheduler always pops from the
+        front, so download start order follows the order files were added.
+        """
+        pending = pending_jobs
+        active = {}
+        finished_count = 0
+
+        while True:
+            self.scheduler_event.clear()
+            current_limit = self.get_concurrent_count()
+
+            while pending and len(active) < current_limit and not self.stop_requested and not self.pause_requested:
+                job = pending[0]
+                dest_for_space_check = job.get("dest") or os.path.dirname(job["local_path"])
+                if self.stop_if_no_space_var.get() and not self.check_space_before_starting_next_file(dest_for_space_check):
+                    self.stop_requested = True
+                    break
+
+                job = pending.pop(0)
+                done_event = threading.Event()
+                result_holder = {"ok": False}
+
+                t = threading.Thread(target=self.download_job_wrapper, args=(job, done_event, result_holder), daemon=True)
+                active[t] = (job, done_event, result_holder)
+                t.start()
+
+            if self.stop_requested and pending:
+                for job in list(pending):
+                    self.ui_add_or_update_file(
+                        job["row_id"], job.get("identifier", identifier), job["file_name"], "Queued - stopped",
+                        "0%", job["size_text"], job["local_path"], job["source_url"]
+                    )
+                    self.queue_stopped_job_for_resume(job, was_active=False)
+                pending.clear()
+
+            finished_threads = []
+            for t, (job, done_event, result_holder) in list(active.items()):
+                if done_event.is_set():
+                    finished_threads.append(t)
+                    if result_holder.get("ok"):
+                        finished_count += 1
+
+            for t in finished_threads:
+                active.pop(t, None)
+
+            with self.progress_lock:
+                total = self.queue_total_files
+                complete = self.queue_completed_files
+
+            left_known = max(0, total - complete) if total else len(pending) + len(active)
+            self.ui_status(
+                f"{identifier}: {complete}/{total or '?'} complete, "
+                f"{left_known} left; {len(active)} active; "
+                f"{len(pending)} ready; limit {current_limit}"
+            )
+
+            if producer_done_event.is_set() and not pending and not active:
+                break
+
+            self.scheduler_event.wait(0.25)
+
+        return finished_count
+
     def download_job_wrapper(self, job, done_event, result_holder):
         try:
             result_holder["ok"] = self.download_one_file(job)

@@ -51,6 +51,19 @@ class DownloaderMixin:
         source_url = job["source_url"]
         config_file = job["config_file"]
 
+        # If a .part decision prompt is open, wait only this download worker,
+        # not the queue preparation/UI. Other active downloads keep going.
+        if job.get("resume_from_part") is None and part_path:
+            event = getattr(self, "part_decision_events", {}).get(part_path)
+            if event is not None:
+                self.ui_add_or_update_file(row_id, identifier, file_name, "Waiting for .part choice", "", size_text, part_path, source_url)
+                self.ui_active_download(row_id, file_name, 0, "", size_text, "Waiting for .part choice")
+                self.ui_log(f"Waiting for .part choice before starting: {part_path}")
+                while not event.is_set() and not self.stop_requested:
+                    event.wait(0.25)
+            if self.stop_requested:
+                raise RuntimeError("Stopped by user")
+
         os.makedirs(os.path.dirname(local_path), exist_ok=True)
 
         self.register_active_download(row_id)

@@ -42,7 +42,7 @@ APP_TITLE = "Internet Archive Downloader"
 QUEUE_FILE_VERSION = 5
 
 
-from app_paths import get_settings_path, get_history_path, get_log_path, get_autosave_path, get_app_base_dir, get_autosave_path
+from app_paths import get_settings_path, get_history_path, get_log_path, get_autosave_path, get_app_base_dir, get_resource_path
 
 
 class IADownloaderGUI(DownloaderMixin, SchedulerMixin):
@@ -50,6 +50,7 @@ class IADownloaderGUI(DownloaderMixin, SchedulerMixin):
         self.root = root
         self.root.title(APP_TITLE)
         self.root.geometry("1440x900")
+        self._set_app_window_icons()
         self.worker_thread = None
         self.queue_check_thread = None
         self.stop_requested = False
@@ -82,10 +83,19 @@ class IADownloaderGUI(DownloaderMixin, SchedulerMixin):
         self.autosave_timer_active = False
         self.autosave_after_first_download_start_done = False
         self.part_resume_choices = {}
+        self.part_decision_events = {}
+
 
         self.status_filter_var = tk.StringVar(value="All")
         self.filter_count_var = tk.StringVar(value="Showing 0 of 0 rows")
         self.status_filter_combo = None
+        # Avoid UI freezes during heavy downloads: large queue windows are updated
+        # incrementally and expensive summary refreshes are throttled.
+        self._last_filter_count_update = 0.0
+        self._last_queue_table_rebuild = 0.0
+        self._last_queue_files_rebuild = 0.0
+        self._last_active_scroll = 0.0
+        self._last_stats_update = 0.0
 
         self.show_urls_var = tk.BooleanVar(value=True)
         self.show_options_var = tk.BooleanVar(value=True)
@@ -108,6 +118,7 @@ class IADownloaderGUI(DownloaderMixin, SchedulerMixin):
         self.queue_completed_files = 0
         self.estimated_total_bytes = 0
         self.estimated_remaining_bytes = 0
+        self._last_streaming_size_update = 0.0
 
         # The top current-file progress bar should represent the active download
         # that started first. The table still shows all active downloads.
@@ -249,6 +260,66 @@ class IADownloaderGUI(DownloaderMixin, SchedulerMixin):
         self.root.config(menu=menubar)
         self.root.update_idletasks()
 
+
+    def _set_app_window_icons(self):
+        """Apply the bundled logo/icon to the title bar and Windows taskbar.
+
+        Tkinter can fall back to the generic Tk feather icon in frozen Windows
+        builds unless both Tk and the Win32 window handles are updated. This
+        method intentionally uses the square multi-size .ico for Windows UI and
+        keeps the wide PNG only for the header artwork.
+        """
+        ico_path = get_resource_path("assets", "internet_archive_downloader_logo.ico")
+        icon_png_path = get_resource_path("assets", "internet_archive_downloader_icon_256.png")
+
+        if sys.platform.startswith("win") and os.path.exists(ico_path):
+            try:
+                self.root.iconbitmap(default=ico_path)
+            except Exception:
+                pass
+
+            # Force the native Windows small/large icons too. This fixes cases
+            # where the title bar/taskbar still shows the default Tk feather.
+            try:
+                import ctypes
+                from ctypes import wintypes
+
+                user32 = ctypes.windll.user32
+                LR_LOADFROMFILE = 0x0010
+                IMAGE_ICON = 1
+                WM_SETICON = 0x0080
+                ICON_SMALL = 0
+                ICON_BIG = 1
+
+                hwnd = self.root.winfo_id()
+                small_icon = user32.LoadImageW(None, ico_path, IMAGE_ICON, 16, 16, LR_LOADFROMFILE)
+                big_icon = user32.LoadImageW(None, ico_path, IMAGE_ICON, 256, 256, LR_LOADFROMFILE)
+                if small_icon:
+                    user32.SendMessageW(wintypes.HWND(hwnd), WM_SETICON, ICON_SMALL, small_icon)
+                    self._native_small_icon_handle = small_icon
+                if big_icon:
+                    user32.SendMessageW(wintypes.HWND(hwnd), WM_SETICON, ICON_BIG, big_icon)
+                    self._native_big_icon_handle = big_icon
+            except Exception:
+                pass
+
+        # Non-Windows fallback and an additional Tk icon source. Keep a Python
+        # reference so Tk does not garbage-collect the image.
+        if os.path.exists(icon_png_path):
+            try:
+                self.app_icon_image = tk.PhotoImage(file=icon_png_path)
+                self.root.iconphoto(True, self.app_icon_image)
+            except Exception:
+                pass
+
+        # Re-apply the .ico after iconphoto on Windows because iconphoto can
+        # overwrite the small title-bar icon in some Tk builds.
+        if sys.platform.startswith("win") and os.path.exists(ico_path):
+            try:
+                self.root.iconbitmap(default=ico_path)
+            except Exception:
+                pass
+
     def _build_ui(self):
         top = ttk.Frame(self.root, padding=8)
         top.pack(fill=tk.BOTH, expand=True)
@@ -259,17 +330,10 @@ class IADownloaderGUI(DownloaderMixin, SchedulerMixin):
         header = ttk.Frame(top, style="Header.TFrame", padding=10)
         header.pack(fill=tk.X, pady=(0, 8))
 
-        logo_path = os.path.join(get_app_base_dir(), "assets", "internet_archive_downloader_logo.png")
+        logo_path = get_resource_path("assets", "internet_archive_downloader_logo.png")
         if os.path.exists(logo_path):
             try:
                 self.logo_image = tk.PhotoImage(file=logo_path)
-                self.root.iconphoto(True, self.logo_image)
-                try:
-                    ico_path = os.path.join(get_app_base_dir(), "assets", "internet_archive_downloader_logo.ico")
-                    if os.path.exists(ico_path):
-                        self.root.iconbitmap(ico_path)
-                except Exception:
-                    pass
 
                 max_w = 230
                 max_h = 145
@@ -864,12 +928,47 @@ class IADownloaderGUI(DownloaderMixin, SchedulerMixin):
         else:
             self.apply_status_filter()
 
+    def is_active_download_status(self, status):
+        """Return True only for rows that should appear in the Active Downloads table."""
+        status = (status or "").lower()
+        return any(term in status for term in ("downloading", "starting", "paused", "retrying"))
+
+    def ensure_active_placeholder(self):
+        if not hasattr(self, "active_tree") or not self.active_tree:
+            return
+        rows = [row for row in self.active_tree.get_children() if row != "__no_active__"]
+        if rows:
+            if self.active_tree.exists("__no_active__"):
+                self.active_tree.delete("__no_active__")
+            return
+        if not self.active_tree.exists("__no_active__"):
+            self.active_tree.insert(
+                "",
+                tk.END,
+                iid="__no_active__",
+                text="No active downloads",
+                values=("", "", "", "", "", "Waiting")
+            )
+
+    def remove_inactive_active_row(self, row_id, status):
+        """Remove a row from Active Downloads once it is no longer actually active."""
+        if not hasattr(self, "active_tree") or not self.active_tree:
+            return
+        if self.is_active_download_status(status):
+            return
+        try:
+            if self.active_tree.exists(row_id):
+                self.active_tree.delete(row_id)
+        except Exception:
+            pass
+        self.ensure_active_placeholder()
+
     def status_matches_filter(self, status, filter_value):
         status = (status or "").lower()
         if filter_value == "All":
             return True
         if filter_value == "Active":
-            return any(term in status for term in ("downloading", "starting", "paused", "retrying"))
+            return self.is_active_download_status(status)
         if filter_value == "Queued":
             return any(term in status for term in ("queued", "redownloading", "not started", "waiting", "limit reduced"))
         if filter_value == "Done":
@@ -919,6 +1018,60 @@ class IADownloaderGUI(DownloaderMixin, SchedulerMixin):
 
         self.filter_count_var.set(f"Showing {len(rows)} of {total_rows} rows ({selected_filter})")
 
+    def update_downloads_tree_row(self, row_id):
+        """Update one Downloads Table row instead of rebuilding thousands of rows.
+
+        Rebuilding the entire table on every progress event made the app feel
+        frozen with large queues. This keeps the visible table current while
+        preserving full rebuilds for manual Refresh/filter changes.
+        """
+        if not self.downloads_tree or not self.downloads_window or not self.downloads_window.winfo_exists():
+            return
+        row = self.download_rows.get(row_id)
+        if not row:
+            return
+
+        selected_filter = self.status_filter_var.get() or "All"
+        visible = self.status_matches_filter(row.get("status", ""), selected_filter)
+        exists = self.downloads_tree.exists(row_id)
+        values = (
+            row.get("display_name", ""),
+            row.get("status", ""),
+            row.get("percent", ""),
+            row.get("size_text", ""),
+            self.normalize_path_text(row.get("path", "")),
+        )
+
+        try:
+            if visible:
+                if exists:
+                    self.downloads_tree.item(row_id, values=values)
+                else:
+                    # Insert at the end for speed. Manual Refresh re-sorts if needed.
+                    self.downloads_tree.insert("", tk.END, iid=row_id, values=values)
+            elif exists:
+                self.downloads_tree.delete(row_id)
+
+            now = time.time()
+            if now - self._last_filter_count_update > 1.0:
+                shown = len(self.downloads_tree.get_children())
+                total = len(self.download_rows)
+                self.filter_count_var.set(f"Showing {shown} of {total} rows ({selected_filter})")
+                self._last_filter_count_update = now
+        except Exception:
+            # A later manual refresh can recover the view.
+            pass
+
+    def maybe_rebuild_secondary_tables(self):
+        """Throttle expensive queue summary windows while downloads are busy."""
+        now = time.time()
+        if self.queue_window and self.queue_window.winfo_exists() and now - self._last_queue_table_rebuild > 2.0:
+            self.rebuild_queue_table()
+            self._last_queue_table_rebuild = now
+        if self.queue_files_window and self.queue_files_window.winfo_exists() and now - self._last_queue_files_rebuild > 2.0:
+            self.rebuild_queue_files_table()
+            self._last_queue_files_rebuild = now
+
     def reorder_download_table(self):
         self.rebuild_download_table()
 
@@ -940,8 +1093,12 @@ class IADownloaderGUI(DownloaderMixin, SchedulerMixin):
         # URL and Options sections are always visible in this layout.
         return
 
-    def update_stats_cards(self):
+    def update_stats_cards(self, force=False):
         try:
+            now = time.time()
+            if not force and now - self._last_stats_update < 0.5:
+                return
+            self._last_stats_update = now
             active = 0
             if hasattr(self, "active_tree"):
                 for row in self.active_tree.get_children():
@@ -949,7 +1106,7 @@ class IADownloaderGUI(DownloaderMixin, SchedulerMixin):
                         continue
                     values = self.active_tree.item(row, "values")
                     status = str(values[-1]).lower() if values else ""
-                    if any(term in status for term in ("downloading", "starting", "paused", "queued", "retrying")):
+                    if self.is_active_download_status(status):
                         active += 1
 
             completed = 0
@@ -990,8 +1147,11 @@ class IADownloaderGUI(DownloaderMixin, SchedulerMixin):
 
     def process_ui_queue(self):
         try:
-            while True:
+            processed = 0
+            max_events_per_tick = 250
+            while processed < max_events_per_tick:
                 event = self.ui_queue.get_nowait()
+                processed += 1
                 kind = event[0]
 
                 if kind == "log":
@@ -1031,6 +1191,11 @@ class IADownloaderGUI(DownloaderMixin, SchedulerMixin):
                     combined_name = f"{item_name}  |  {file_name}" if item_name else file_name
                     values = (f"{percent}%", downloaded_text, speed_text, eta_text, size_text, status)
 
+                    if not self.is_active_download_status(status):
+                        self.remove_inactive_active_row(row_id, status)
+                        self.update_stats_cards()
+                        continue
+
                     if self.active_tree.exists("__no_active__"):
                         self.active_tree.delete("__no_active__")
 
@@ -1047,11 +1212,13 @@ class IADownloaderGUI(DownloaderMixin, SchedulerMixin):
                         anchor_row = self.current_display_row_id
                     except Exception:
                         anchor_row = None
-                    if anchor_row and self.active_tree.exists(anchor_row):
-                        self.active_tree.see(anchor_row)
-                    elif self.active_tree.get_children():
-                        self.active_tree.see(self.active_tree.get_children()[0])
-                    self.active_tree.update_idletasks()
+                    now = time.time()
+                    if now - self._last_active_scroll > 0.75:
+                        if anchor_row and self.active_tree.exists(anchor_row):
+                            self.active_tree.see(anchor_row)
+                        elif self.active_tree.get_children():
+                            self.active_tree.see(self.active_tree.get_children()[0])
+                        self._last_active_scroll = now
                     self.update_stats_cards()
 
                 elif kind == "active_clear":
@@ -1085,10 +1252,13 @@ class IADownloaderGUI(DownloaderMixin, SchedulerMixin):
                         "source_url": source_url,
                     })
 
-                    self.apply_status_filter()
-                    self.rebuild_queue_table()
-                    self.rebuild_queue_files_table()
-                    self.update_stats_cards()
+                    # Keep the Active Downloads table true to its name: when a
+                    # file changes to Done, Skipped, Queued, Failed, etc., remove
+                    # it from the active-only view instead of leaving stale rows.
+                    self.remove_inactive_active_row(row_id, status)
+
+                    self.update_downloads_tree_row(row_id)
+                    self.maybe_rebuild_secondary_tables()
                     self.update_stats_cards()
 
                 elif kind == "error_row":
@@ -1110,9 +1280,10 @@ class IADownloaderGUI(DownloaderMixin, SchedulerMixin):
                         "source_url": source_url,
                     })
 
-                    self.apply_status_filter()
-                    self.rebuild_queue_table()
-                    self.rebuild_queue_files_table()
+                    self.remove_inactive_active_row(row_id, "Bad URL / Error")
+
+                    self.update_downloads_tree_row(row_id)
+                    self.maybe_rebuild_secondary_tables()
                     self.update_stats_cards()
 
                 elif kind == "buttons":
@@ -1703,6 +1874,7 @@ class IADownloaderGUI(DownloaderMixin, SchedulerMixin):
             "source_url": job.get("source_url", ""),
             "config_file": job.get("config_file"),
             "dest": self.normalize_path_text(job.get("dest", "")),
+            "queue_index": job.get("queue_index", 0),
             "file_index": job.get("file_index", 0),
             "stop_order": job.get("stop_order", 0),
             "was_active_when_stopped": bool(job.get("was_active_when_stopped", False)),
@@ -1727,6 +1899,7 @@ class IADownloaderGUI(DownloaderMixin, SchedulerMixin):
             "source_url": data.get("source_url", identifier),
             "config_file": data.get("config_file"),
             "dest": self.normalize_path_text(data.get("dest", "")),
+            "queue_index": data.get("queue_index", 0),
             "file_index": data.get("file_index", 0),
             "stop_order": data.get("stop_order", 0),
             "was_active_when_stopped": bool(data.get("was_active_when_stopped", False)),
@@ -2215,7 +2388,7 @@ class IADownloaderGUI(DownloaderMixin, SchedulerMixin):
 
                     row_id = self.safe_row_id(identifier, name)
                     local_path, _ = self.find_existing_local_file(dest, identifier, name)
-                    part_path, part_size, can_resume_part = self.get_part_file_info(local_path, size, name)
+                    part_path, part_size, can_resume_part = self.get_part_file_info(local_path, size, name, defer_prompt=True)
                     status_text = "Queued - resume .part" if should_download and can_resume_part else ("Queued" if should_download else "Skipped")
                     if row_id not in self.download_rows:
                         self.download_rows[row_id] = {"order": len(self.download_rows)}
@@ -2281,6 +2454,38 @@ class IADownloaderGUI(DownloaderMixin, SchedulerMixin):
             self.ui_status("Queue size check complete")
 
         return grand_total, remaining_total, eligible_file_count
+
+    def add_live_queue_size_estimate(self, total_bytes=0, remaining_bytes=0, file_count=None, force=False):
+        """Update queue size while the streaming queue is still being built.
+
+        Start mode no longer waits for a full pre-scan, so this keeps the
+        status bar useful by accumulating sizes as each downloadable file is
+        discovered. It is intentionally throttled to avoid UI freezes on very
+        large IA items.
+        """
+        try:
+            total_bytes = int(total_bytes or 0)
+        except Exception:
+            total_bytes = 0
+        try:
+            remaining_bytes = int(remaining_bytes or 0)
+        except Exception:
+            remaining_bytes = 0
+
+        with self.progress_lock:
+            self.estimated_total_bytes += total_bytes
+            self.estimated_remaining_bytes += remaining_bytes
+            total = self.estimated_total_bytes
+            remaining = self.estimated_remaining_bytes
+            count = self.queue_total_files if file_count is None else file_count
+
+        now = time.time()
+        if force or (now - getattr(self, "_last_streaming_size_update", 0.0)) >= 1.0:
+            self._last_streaming_size_update = now
+            self.ui_total_size(
+                f"Total queue size: {self.format_bytes(total)} discovered so far "
+                f"(remaining download: {self.format_bytes(remaining)}, {count} file(s) found; still scanning)"
+            )
 
     def check_destination_space(self, dest, remaining_bytes):
         """
@@ -2458,6 +2663,22 @@ class IADownloaderGUI(DownloaderMixin, SchedulerMixin):
             else:
                 self.resume_pending_jobs.append(job)
 
+    def dedupe_jobs_preserve_order(self, jobs):
+        """Remove duplicate jobs without changing queue order.
+
+        Used for the main Start run so files download exactly in the order they
+        were discovered: URL 1 file 1, URL 1 file 2, ..., then URL 2, etc.
+        """
+        seen = set()
+        unique = []
+        for job in jobs:
+            key = job.get("row_id") or job.get("local_path")
+            if key in seen:
+                continue
+            seen.add(key)
+            unique.append(job)
+        return unique
+
     def dedupe_jobs(self, jobs):
         seen = set()
         unique = []
@@ -2468,23 +2689,54 @@ class IADownloaderGUI(DownloaderMixin, SchedulerMixin):
             seen.add(key)
             unique.append(job)
 
-        def priority(job):
-            local_path = job.get("local_path", "")
-            part_path = local_path + ".part" if local_path else ""
+        # Current URL textbox order is the source of truth. Older autosave files
+        # may not have queue_index, so infer it from the URL/identifier list.
+        url_order = {}
+        try:
+            for idx, url in enumerate(self.get_urls(), start=1):
+                ident = self.extract_identifier(url)
+                if ident and ident not in url_order:
+                    url_order[ident] = idx
+        except Exception:
+            pass
+
+        def queue_index_for(job):
             try:
-                # Stopped mid-file downloads have a .part file and should resume first.
+                q = int(job.get("queue_index", 0) or 0)
+            except Exception:
+                q = 0
+            if q <= 0:
+                q = url_order.get(job.get("identifier", ""), 0)
+            return q
+
+        def file_index_for(job):
+            try:
+                return int(job.get("file_index", 0) or 0)
+            except Exception:
+                return 0
+
+        def resume_state_for(job):
+            local_path = job.get("local_path", "")
+            part_path = job.get("part_path") or (local_path + ".part" if local_path else "")
+            try:
                 if part_path and os.path.exists(part_path) and os.path.getsize(part_path) > 0:
-                    return (0, -int(job.get("stop_order", 0) or 0), job.get("file_index", 0))
+                    return 0
             except Exception:
                 pass
-
-            # Explicitly marked stopped-active jobs come before never-started jobs.
             if job.get("was_active_when_stopped"):
-                # Sort active stopped jobs ahead of never-started jobs.
-                # Negative stop_order keeps the most recently stopped active file first.
-                return (1, -int(job.get("stop_order", 0) or 0), job.get("file_index", 0))
+                return 0
+            return 1
 
-            return (2, job.get("file_index", 0), job.get("row_id", ""))
+        def priority(job):
+            # Strict URL/file order first. Resume/partial status only breaks ties
+            # within the same URL/file sequence instead of jumping later URLs
+            # ahead of earlier ones.
+            return (
+                queue_index_for(job),
+                file_index_for(job),
+                resume_state_for(job),
+                job.get("row_id", ""),
+            )
 
         return sorted(unique, key=priority)
 
@@ -2642,7 +2894,11 @@ class IADownloaderGUI(DownloaderMixin, SchedulerMixin):
             with self.progress_lock:
                 self.queue_total_files = 0
                 self.queue_completed_files = 0
+                self.estimated_total_bytes = 0
+                self.estimated_remaining_bytes = 0
+                self._last_streaming_size_update = 0.0
 
+            self.ui_total_size("Total queue size: scanning metadata...")
             self.ui_progress(0)
             self.ui_file_progress(0, "Current file: none")
             self.ui_active_clear()
@@ -2654,50 +2910,104 @@ class IADownloaderGUI(DownloaderMixin, SchedulerMixin):
             queue_items = [(u, self.extract_identifier(u)) for u in urls]
             self.ui_log(f"Start clicked for queue with {len(queue_items)} item(s).")
 
+            # Do not block Start by fully preparing every URL first. Check disk now,
+            # then keep checking before each file starts. A prior Refresh Queue result
+            # is still used when available.
             if self.has_valid_check_cache():
                 remaining_bytes = self.last_check_remaining_bytes
-                self.ui_log("Using previous completed Refresh Queue result; URL/destination/extensions unchanged.")
-                self.ui_status("Using previous Refresh Queue result")
+                self.ui_log("Using previous completed Refresh Queue result for disk-space precheck.")
+                if not self.check_destination_space(dest, remaining_bytes):
+                    self.ui_status("Stopped - not enough disk space")
+                    self.ui_log("Downloads were not started because the destination drive does not have enough free space.")
+                    return
             else:
-                self.ui_log("Checking queue size now before downloads begin...")
-                total_bytes, remaining_bytes, file_count = self.estimate_queue_sizes(queue_items, dest, config_file)
-                if not self.stop_requested:
-                    self.store_check_cache(total_bytes, remaining_bytes, file_count)
-
-            if self.stop_requested:
-                self.ui_status("Stopped during queue check")
-                self.ui_log("Start cancelled during queue check. Press Start again to begin from the current in-memory stopped queue if available.")
-                return
-
-            if not self.check_destination_space(dest, remaining_bytes):
-                self.ui_status("Stopped - not enough disk space")
-                self.ui_log("Downloads were not started because the destination drive does not have enough free space.")
-                return
+                try:
+                    _, _, free = shutil.disk_usage(dest)
+                    self.ui_disk_space(f"Disk space: {self.format_bytes(free)} free; full queue estimate will update as metadata is read")
+                    self.ui_log("Starting downloads while building the queue. Disk space is checked before each new file starts.")
+                except Exception as e:
+                    self.ui_disk_space(f"Disk space: could not check ({e})")
 
             self.ui_log("You can change 'Downloads at once' during the run; the new value is used before each next file starts.")
             self.ui_log("Existing files count as completed when skipped.")
             self.ui_log("Each new Internet Archive site/item downloads into one top-level subfolder.")
             self.ui_log("Internal archive folder structure is preserved automatically.")
             self.ui_log("Skip check still detects both destination/item_identifier/file and older destination/file layouts.\n")
+            self.ui_log("Streaming queue enabled: downloads start as soon as pending files are found while later URLs continue preparing.")
 
-            for item_index, (source_url, identifier) in enumerate(queue_items, start=1):
-                if self.stop_requested:
-                    break
+            total_items = len(queue_items)
+            streaming_pending_jobs = []
+            producer_done = threading.Event()
 
-                if not identifier or " " in identifier:
-                    error = "Invalid Internet Archive identifier or URL."
-                    self.ui_log(f"ERROR for {source_url}: {error}")
-                    self.ui_add_error(self.safe_row_id("ERROR", source_url), source_url, identifier or source_url, error)
-                    continue
+            def add_streaming_job(job):
+                streaming_pending_jobs.append(job)
+                self.scheduler_event.set()
 
-                self.ui_status(f"Item {item_index}/{len(queue_items)}: reading metadata for {identifier}")
-                self.ui_log(f"Starting item {item_index}/{len(queue_items)}: {identifier}")
+            scheduler_thread = threading.Thread(
+                target=self.run_streaming_scheduler,
+                args=("Full queue", streaming_pending_jobs, producer_done),
+                daemon=True,
+            )
+            scheduler_thread.start()
 
-                try:
-                    self.process_item(source_url, identifier, dest, config_file)
-                except Exception as e:
-                    self.ui_log(f"ERROR for {source_url}: {e}")
-                    self.ui_add_error(self.safe_row_id("ERROR", source_url), source_url, identifier, str(e))
+            try:
+                for item_index, (source_url, identifier) in enumerate(queue_items, start=1):
+                    if self.stop_requested:
+                        self.ui_log(f"Queue stopped before preparing item {item_index}/{total_items}: {identifier or source_url}")
+                        break
+
+                    if not identifier or " " in identifier:
+                        error = "Invalid Internet Archive identifier or URL."
+                        self.ui_log(f"ERROR for {source_url}: {error}")
+                        self.ui_add_error(self.safe_row_id("ERROR", source_url), source_url, identifier or source_url, error)
+                        continue
+
+                    self.ui_status(f"Preparing item {item_index}/{total_items}: {identifier}")
+                    self.ui_log(f"Preparing item {item_index}/{total_items}: {identifier}")
+
+                    try:
+                        self.collect_pending_jobs_for_item(
+                            source_url,
+                            identifier,
+                            dest,
+                            config_file,
+                            queue_index=item_index,
+                            job_callback=add_streaming_job,
+                        )
+                    except Exception as e:
+                        self.ui_log(f"ERROR for {source_url}: {e}")
+                        self.ui_add_error(self.safe_row_id("ERROR", source_url), source_url, identifier, str(e))
+            finally:
+                producer_done.set()
+                self.scheduler_event.set()
+
+                # The queue can finish scanning while downloads are still running.
+                # Update the size label immediately so it no longer says
+                # "still scanning" during the rest of the download run.
+                with self.progress_lock:
+                    scanned_total = self.estimated_total_bytes
+                    scanned_remaining = self.estimated_remaining_bytes
+                    scanned_count = self.queue_total_files
+                self.ui_total_size(
+                    f"Total queue size: {self.format_bytes(scanned_total)} "
+                    f"(remaining download estimate: {self.format_bytes(scanned_remaining)}, "
+                    f"{scanned_count} file(s); scan complete)"
+                )
+                self.ui_log(
+                    f"Queue scan complete: {scanned_count} file(s), "
+                    f"{self.format_bytes(scanned_total)} discovered; downloads continuing."
+                )
+
+            scheduler_thread.join()
+
+            with self.progress_lock:
+                final_total = self.estimated_total_bytes
+                final_remaining = self.estimated_remaining_bytes
+                final_count = self.queue_total_files
+            self.ui_total_size(
+                f"Total queue size: {self.format_bytes(final_total)} "
+                f"(remaining download estimate: {self.format_bytes(final_remaining)}, {final_count} file(s); scan complete)"
+            )
 
             self.ui_status("Finished" if not self.stop_requested else "Stopped")
             if not self.stop_requested:
@@ -2732,31 +3042,44 @@ class IADownloaderGUI(DownloaderMixin, SchedulerMixin):
         years = days / 365
         return f"{years:.1f} years old"
 
-    def ask_resume_part_file(self, part_path, part_size, expected_size, file_name):
+    def ask_resume_part_file(self, part_path, part_size, expected_size, file_name, block=True):
+        """Ask how to handle a .part file.
+
+        With block=False, the prompt is scheduled and this returns immediately.
+        Download workers wait only when they are about to download that specific
+        file, so the queue/UI can keep processing while the prompt is open.
+        """
         setting = self.part_action_var.get() if hasattr(self, "part_action_var") else "Ask, auto-start over after 5 minutes"
 
         if setting == "Always resume .part files":
             self.ui_log(f".part handling setting: automatically resume {part_path}")
-            return True
+            return True if block else (True, None)
 
         if setting == "Always start over":
             self.ui_log(f".part handling setting: automatically start over {part_path}")
-            return False
+            return False if block else (False, None)
+
+        if part_path in self.part_resume_choices:
+            value = bool(self.part_resume_choices[part_path])
+            return value if block else (value, None)
+
+        if part_path in getattr(self, "part_decision_events", {}):
+            event = self.part_decision_events[part_path]
+            if block:
+                event.wait()
+                return bool(self.part_resume_choices.get(part_path, False))
+            return None, event
 
         age_text = self.format_file_age(part_path)
         expected_text = self.format_bytes(expected_size) if expected_size else "unknown total size"
-
-        # Tk must create dialogs on the UI thread. This method is called from
-        # worker threads, so use root.after + Event to safely ask the user.
-        result = {"value": False}
-        done = threading.Event()
+        event = threading.Event()
+        self.part_decision_events[part_path] = event
 
         def show_dialog():
             win = tk.Toplevel(self.root)
             win.title("Partial download found")
             win.geometry("720x380")
             win.transient(self.root)
-            win.grab_set()
 
             frame = ttk.Frame(win, padding=14)
             frame.pack(fill=tk.BOTH, expand=True)
@@ -2789,16 +3112,26 @@ class IADownloaderGUI(DownloaderMixin, SchedulerMixin):
                 if closed["done"]:
                     return
                 closed["done"] = True
-                result["value"] = bool(value)
-                try:
-                    win.grab_release()
-                except Exception:
-                    pass
+                value = bool(value)
+                self.part_resume_choices[part_path] = value
+                if not value:
+                    try:
+                        os.remove(part_path)
+                        self.ui_log(f"Deleted partial .part file and will start over: {part_path}")
+                    except Exception as e:
+                        self.ui_log(f"Could not delete .part file {part_path}: {e}")
+                else:
+                    self.ui_log(
+                        f"User chose to resume .part file: {part_path} "
+                        f"({self.format_bytes(part_size)}, {self.format_file_age(part_path)})"
+                    )
+                event.set()
+                self.scheduler_event.set()
+                self.part_decision_events.pop(part_path, None)
                 try:
                     win.destroy()
                 except Exception:
                     pass
-                done.set()
 
             def tick():
                 if closed["done"]:
@@ -2806,7 +3139,7 @@ class IADownloaderGUI(DownloaderMixin, SchedulerMixin):
                 remaining = seconds_left["value"]
                 mins, secs = divmod(remaining, 60)
                 countdown_var.set(
-                    f"Choose Resume or Start Over. If no choice is made, this will automatically START OVER in {mins}:{secs:02d}."
+                    f"Choose Resume or Start Over. If no choice is made, this will automatically START OVER in {mins}:{secs:02d}. Downloads continue in the background."
                 )
                 if remaining <= 0:
                     finish(False)
@@ -2822,13 +3155,17 @@ class IADownloaderGUI(DownloaderMixin, SchedulerMixin):
 
         try:
             self.root.after(0, show_dialog)
-            done.wait()
-            return bool(result["value"])
+            if block:
+                event.wait()
+                return bool(self.part_resume_choices.get(part_path, False))
+            return None, event
         except Exception as e:
             self.ui_log(f"Could not show .part prompt; starting over by default: {e}")
-            return False
+            self.part_resume_choices[part_path] = False
+            event.set()
+            return False if block else (False, None)
 
-    def get_part_file_info(self, local_path, expected_size=None, file_name=""):
+    def get_part_file_info(self, local_path, expected_size=None, file_name="", defer_prompt=False):
         part_path = local_path + ".part"
         try:
             if os.path.exists(part_path):
@@ -2843,28 +3180,187 @@ class IADownloaderGUI(DownloaderMixin, SchedulerMixin):
 
                 # Ask the user once per .part file per session.
                 if part_path not in self.part_resume_choices:
-                    resume_part = self.ask_resume_part_file(part_path, part_size, expected_size, file_name or os.path.basename(local_path))
-                    self.part_resume_choices[part_path] = resume_part
+                    if defer_prompt:
+                        resume_part, decision_event = self.ask_resume_part_file(
+                            part_path, part_size, expected_size, file_name or os.path.basename(local_path), block=False
+                        )
+                        if resume_part is None:
+                            return part_path, part_size, None
+                    else:
+                        resume_part = self.ask_resume_part_file(
+                            part_path, part_size, expected_size, file_name or os.path.basename(local_path), block=True
+                        )
 
+                    self.part_resume_choices[part_path] = bool(resume_part)
                     if not resume_part:
-                        try:
-                            os.remove(part_path)
-                            self.ui_log(f"Deleted partial .part file and will start over: {part_path}")
-                        except Exception as e:
-                            self.ui_log(f"Could not delete .part file {part_path}: {e}")
                         return part_path, 0, False
-
-                    self.ui_log(
-                        f"User chose to resume .part file: {part_path} "
-                        f"({self.format_bytes(part_size)}, {self.format_file_age(part_path)})"
-                    )
 
                 return part_path, part_size, bool(self.part_resume_choices.get(part_path, False))
         except Exception as e:
             self.ui_log(f"Could not inspect .part file {part_path}: {e}")
         return part_path, 0, False
 
+    def collect_pending_jobs_for_item(self, source_url, identifier, dest, config_file, queue_index=0, job_callback=None):
+        """
+        Read one Internet Archive item, update rows/skips, and return pending jobs
+        without running the per-item scheduler.
+
+        This lets the main Start action schedule files across the whole URL queue,
+        so open download slots are filled by the next URL instead of waiting for the
+        current URL's last few large files to finish.
+        """
+        item = get_item(identifier, config_file=config_file) if config_file else get_item(identifier)
+
+        files = []
+        for f in item.files:
+            self.wait_while_check_paused(f"reading file list for {identifier}")
+
+            if self.stop_requested:
+                self.ui_log(f"Stopped while reading file list for {identifier}.")
+                break
+
+            name = f.get("name")
+            size_raw = f.get("size")
+
+            if not name:
+                continue
+
+            base = os.path.basename(name).lower()
+            if self.should_skip_metadata_file(base):
+                continue
+
+            if not self.file_allowed_by_extension(name):
+                continue
+
+            try:
+                expected_size = int(size_raw) if size_raw is not None else None
+            except Exception:
+                expected_size = None
+
+            files.append((name, expected_size))
+
+        if self.stop_requested and not files:
+            self.ui_status("Stopped before downloads started")
+            return [], 0, 0
+
+        if not files:
+            raise RuntimeError("No downloadable files found, or item metadata could not be read.")
+
+        total = len(files)
+        completed_for_item = 0
+        pending_jobs = []
+        item_total_bytes = 0
+        item_remaining_bytes = 0
+
+        with self.progress_lock:
+            self.queue_total_files += total
+            current_discovered_files = self.queue_total_files
+
+        self.add_live_queue_size_estimate(0, 0, file_count=current_discovered_files, force=True)
+        self.ui_log(f"{identifier}: found {total} downloadable file(s). Downloads may start while later URLs are still being prepared.")
+        self.scheduler_event.set()
+
+        for file_index, (file_name, expected_size) in enumerate(files, start=1):
+            if self.stop_requested:
+                break
+
+            row_id = self.safe_row_id(identifier, file_name)
+            local_path, exists_locally = self.find_existing_local_file(dest, identifier, file_name)
+            size_text = self.format_bytes(expected_size)
+            file_size_for_estimate = int(expected_size or 0)
+            item_total_bytes += file_size_for_estimate
+            # Add total immediately; remaining is added once the skip/download
+            # decision below is known. Unknown-size files count as 0 bytes until
+            # the downloader reports actual progress.
+            self.add_live_queue_size_estimate(file_size_for_estimate, 0)
+
+            part_path, part_size, can_resume_part = self.get_part_file_info(local_path, expected_size, file_name, defer_prompt=True)
+
+            if exists_locally:
+                local_size = os.path.getsize(local_path)
+
+                if not self.size_check_var.get():
+                    completed_for_item += 1
+                    self.mark_completed()
+                    self.record_history(identifier, file_name, local_path, expected_size, "Skipped", source_url)
+                    self.ui_add_or_update_file(row_id, identifier, file_name, "Skipped", "100%", size_text, local_path, source_url)
+                    self.ui_file_progress(100, f"Skipped existing file: {file_name}")
+                    self.ui_detail_log(f"Skipped existing file without size check: {local_path}")
+                    continue
+
+                if expected_size is not None and local_size == expected_size:
+                    completed_for_item += 1
+                    self.mark_completed()
+                    self.record_history(identifier, file_name, local_path, expected_size, "Skipped", source_url)
+                    self.ui_add_or_update_file(row_id, identifier, file_name, "Skipped", "100%", size_text, local_path, source_url)
+                    self.ui_file_progress(100, f"Skipped complete file: {file_name}")
+                    self.ui_detail_log(f"Skipped size-matched file: {local_path}")
+                    continue
+
+                mismatch_pct = self.percent_from_sizes(local_size, expected_size) if expected_size else 0
+                self.ui_add_or_update_file(row_id, identifier, file_name, "Redownloading", f"{mismatch_pct}%", size_text, local_path, source_url)
+                self.ui_detail_log(
+                    f"Redownloading size mismatch: {local_path} "
+                    f"local={self.format_bytes(local_size)}, expected={size_text}"
+                )
+            else:
+                if can_resume_part is True:
+                    resume_pct = self.percent_from_sizes(part_size, expected_size) if expected_size else 0
+                    self.ui_add_or_update_file(
+                        row_id,
+                        identifier,
+                        file_name,
+                        "Queued - resume .part",
+                        f"{resume_pct}%",
+                        size_text,
+                        part_path,
+                        source_url
+                    )
+                    self.ui_detail_log(
+                        f"Found partial download to resume: {part_path} "
+                        f"({self.format_bytes(part_size)} of {size_text})"
+                    )
+                elif can_resume_part is None:
+                    resume_pct = self.percent_from_sizes(part_size, expected_size) if expected_size else 0
+                    self.ui_add_or_update_file(
+                        row_id, identifier, file_name, "Waiting for .part choice",
+                        f"{resume_pct}%", size_text, part_path, source_url
+                    )
+                else:
+                    self.ui_add_or_update_file(row_id, identifier, file_name, "Queued", "0%", size_text, local_path, source_url)
+
+            item_remaining_bytes += file_size_for_estimate
+            self.add_live_queue_size_estimate(0, file_size_for_estimate)
+
+            job = {
+                "identifier": identifier,
+                "source_url": source_url,
+                "queue_index": queue_index,
+                "file_index": file_index,
+                "file_name": file_name,
+                "expected_size": expected_size,
+                "local_path": local_path,
+                "row_id": row_id,
+                "size_text": size_text,
+                "config_file": config_file,
+                "dest": dest,
+                "part_path": part_path,
+                "resume_from_part": can_resume_part,
+            }
+            pending_jobs.append(job)
+            if job_callback is not None:
+                job_callback(job)
+
+        self.add_live_queue_size_estimate(0, 0, force=True)
+        self.ui_log(
+            f"Prepared item: {identifier} ({completed_for_item}/{total} already complete/skipped, "
+            f"{len(pending_jobs)} queued for download; "
+            f"{self.format_bytes(item_total_bytes)} discovered, {self.format_bytes(item_remaining_bytes)} remaining)."
+        )
+        return pending_jobs, completed_for_item, total
+
     def process_item(self, source_url, identifier, dest, config_file):
+        queue_index = 0
         item = get_item(identifier, config_file=config_file) if config_file else get_item(identifier)
 
         files = []
@@ -2914,7 +3410,7 @@ class IADownloaderGUI(DownloaderMixin, SchedulerMixin):
             local_path, exists_locally = self.find_existing_local_file(dest, identifier, file_name)
             size_text = self.format_bytes(expected_size)
 
-            part_path, part_size, can_resume_part = self.get_part_file_info(local_path, expected_size, file_name)
+            part_path, part_size, can_resume_part = self.get_part_file_info(local_path, expected_size, file_name, defer_prompt=True)
 
             if exists_locally:
                 local_size = os.path.getsize(local_path)
@@ -2947,7 +3443,7 @@ class IADownloaderGUI(DownloaderMixin, SchedulerMixin):
                 )
                 # Keep the old file until a new .part download succeeds.
             else:
-                if can_resume_part:
+                if can_resume_part is True:
                     resume_pct = self.percent_from_sizes(part_size, expected_size) if expected_size else 0
                     self.ui_add_or_update_file(
                         row_id,
@@ -2963,12 +3459,19 @@ class IADownloaderGUI(DownloaderMixin, SchedulerMixin):
                         f"Found partial download to resume: {part_path} "
                         f"({self.format_bytes(part_size)} of {size_text})"
                     )
+                elif can_resume_part is None:
+                    resume_pct = self.percent_from_sizes(part_size, expected_size) if expected_size else 0
+                    self.ui_add_or_update_file(
+                        row_id, identifier, file_name, "Waiting for .part choice",
+                        f"{resume_pct}%", size_text, part_path, source_url
+                    )
                 else:
                     self.ui_add_or_update_file(row_id, identifier, file_name, "Queued", "0%", size_text, local_path, source_url)
 
-            pending_jobs.append({
+            job = {
                 "identifier": identifier,
                 "source_url": source_url,
+                "queue_index": queue_index,
                 "file_index": file_index,
                 "file_name": file_name,
                 "expected_size": expected_size,
@@ -2979,7 +3482,10 @@ class IADownloaderGUI(DownloaderMixin, SchedulerMixin):
                 "dest": dest,
                 "part_path": part_path,
                 "resume_from_part": can_resume_part,
-            })
+            }
+            pending_jobs.append(job)
+            if job_callback is not None:
+                job_callback(job)
 
         completed_for_item += self.run_dynamic_scheduler(identifier, total, completed_for_item, pending_jobs)
 
